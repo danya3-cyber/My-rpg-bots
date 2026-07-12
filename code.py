@@ -8,7 +8,7 @@ from threading import Thread
 
 # ================= НАСТРОЙКА БОТА =================
 # ТОКЕН, полученный от @BotFather
-TOKEN = os.environ.get("8988649368:AAFwxt6EAH0y_1awKWWAUOrPUB0yF93FZ9A")
+TOKEN = os.environ.get("BOT_TOKEN")
 bot = telebot.TeleBot(TOKEN)
 
 # Имя файла для сохранения базы данных игроков
