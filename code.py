@@ -24,7 +24,7 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 # ================= НАСТРОЙКА АДМИНКИ =================
-ADMIN_IDS = [6597219983] # <--- ЗАМЕНИТЕ НА СВОЙ ID!
+ADMIN_IDS = [6597219983] # <--- ВАШ TELEGRAM ID!
 
 def is_admin(message):
     return message.from_user.id in ADMIN_IDS
@@ -81,7 +81,7 @@ def init_db():
             gold_boost_percent INTEGER DEFAULT 0,
             xp_boost_percent INTEGER DEFAULT 0,
             inventory TEXT DEFAULT '[]',
-            last_boss_fight_timestamp INTEGER DEFAULT 0 -- Новый столбец для кулдауна босса
+            last_boss_fight_timestamp INTEGER DEFAULT 0
         );
     """)
     conn.commit()
@@ -92,15 +92,17 @@ def init_db():
         "gold_boost_percent": "INTEGER DEFAULT 0",
         "xp_boost_percent": "INTEGER DEFAULT 0",
         "inventory": "TEXT DEFAULT '[]'",
-        "last_boss_fight_timestamp": "INTEGER DEFAULT 0" # Добавляем новое поле
+        "last_boss_fight_timestamp": "INTEGER DEFAULT 0"
     }
 
     if IS_POSTGRES:
+        # Для PostgreSQL: SELECT column_name FROM information_schema.columns...
         cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='players' AND table_schema='public';")
+        existing_columns = [col[0] for col in cur.fetchall()]
     else:
+        # Для SQLite: PRAGMA table_info(players) возвращает (cid, name, type, notnull, dflt_value, pk)
         cur.execute("PRAGMA table_info(players);")
-    
-    existing_columns = [col[1] for col in cur.fetchall()]
+        existing_columns = [col[1] for col in cur.fetchall()]
 
     for col_name, col_type in columns_to_add.items():
         if col_name not in existing_columns:
@@ -147,7 +149,7 @@ def get_player(user_id, username):
             "gold_boost_percent": 0,
             "xp_boost_percent": 0,
             "inventory": [],
-            "last_boss_fight_timestamp": 0 # Дефолтное значение
+            "last_boss_fight_timestamp": 0
         }
         
         bp_claimed_str = json.dumps(player["bp_claimed"])
@@ -190,7 +192,7 @@ def get_player(user_id, username):
             "gold_boost_percent": row[13],
             "xp_boost_percent": row[14],
             "inventory": json.loads(row[15]) if row[15] else [],
-            "last_boss_fight_timestamp": row[16] # Загрузка кулдауна
+            "last_boss_fight_timestamp": row[16]
         }
         
     cur.close()
@@ -511,33 +513,8 @@ def game_loop(message):
 
     # --- КНОПКА: БАТЛ ПАСС ---
     elif message.text == "🎫 Батл Пасс":
-        text = "🎫 *БОЕВОЙ ПРОПУСК (БАТЛ ПАСС)* 🎫\n\n"
-        text += f"Ваш прогресс: *{player['bp_xp']}* 🌟\n\n"
-        text += "🎁 *Сетка наград (60 Уровней):*\n"
-        
-        inline_markup = types.InlineKeyboardMarkup()
-        
-        for tier, data in BP_TIERS.items():
-            if tier in player["bp_claimed"]:
-                status = "✅ Забрано"
-            elif player["bp_xp"] >= data["req"]:
-                status = "🎁 Доступно!"
-                btn = types.InlineKeyboardButton(
-                    text=f"Получить Уровень {tier}", 
-                    callback_data=f"claim_bp_{tier}"
-                )
-                inline_markup.add(btn)
-            else:
-                status = f"🔒 Закрыто (нужно {data['req']} 🌟)"
-                
-            text += f"• *Ур. {tier}*: {data['reward_text']} — {status}\n"
-            
-        bot.send_message(
-            message.chat.id,
-            text,
-            parse_mode="Markdown",
-            reply_markup=inline_markup
-        )
+        send_bp_page(message.chat.id, user_id, 1) # Отправляем первую страницу БП
+
 
     # --- КНОПКА: МАГАЗИН ---
     elif message.text == "🛒 Магазин":
@@ -586,31 +563,40 @@ def game_loop(message):
             parse_mode="Markdown",
         )
 
-        base_player_damage = random.randint(15, 25) + (player["level"] * 3) + player["dmg_bonus"]
+        # --- Симуляция боя (несколько раундов до победы/поражения) ---
+        current_monster_hp = monster["hp"]
         
-        is_crit = False
-        if random.randint(1, 100) <= player["crit_chance"]:
-            base_player_damage *= 2
-            is_crit = True
-
-        monster_damage = random.randint(5, monster["dmg"])
-        actual_monster_damage = max(1, monster_damage - player["defense"]) # Защита игрока снижает урон
+        battle_log_lines = []
         
-        actual_monster_hp = monster["hp"]
-        actual_player_damage_to_monster = max(1, base_player_damage - monster["defense"]) # Защита монстра снижает урон игрока
-
-        # --- Симуляция быстрого боя (несколько раундов до победы/поражения) ---
-        battle_log_rounds = []
-        while player["hp"] > 0 and actual_monster_hp > 0:
+        while player["hp"] > 0 and current_monster_hp > 0:
             # Игрок атакует
-            actual_monster_hp -= actual_player_damage_to_monster
+            player_base_damage = random.randint(15, 25) + (player["level"] * 3) + player["dmg_bonus"]
+            is_crit = False
+            if random.randint(1, 100) <= player["crit_chance"]:
+                player_base_damage *= 2
+                is_crit = True
+            
+            player_actual_damage_to_monster = max(1, player_base_damage - monster["defense"])
+            current_monster_hp -= player_actual_damage_to_monster
+            
+            battle_log_lines.append(
+                f"Вы нанесли {int(player_actual_damage_to_monster)} урона " + 
+                ("💥*КРИТ!* " if is_crit else "") + 
+                f"*{monster['name']}* (осталось HP: {max(0, current_monster_hp)})."
+            )
+
+            if current_monster_hp <= 0: break # Монстр повержен
+
             # Монстр атакует
-            player["hp"] -= actual_monster_damage
-        
-        if player["hp"] < 0:
-            player["hp"] = 0
-        if actual_monster_hp < 0:
-            actual_monster_hp = 0
+            monster_base_damage = random.randint(5, monster["dmg"])
+            player_actual_damage_taken = max(1, monster_base_damage - player["defense"])
+            player["hp"] -= player_actual_damage_taken
+            
+            battle_log_lines.append(
+                f"*{monster['name']}* нанес вам {player_actual_damage_taken} урона (ваше HP: {max(0, player['hp'])})."
+            )
+            
+        final_battle_log = "\n".join(battle_log_lines[-5:]) # Последние 5 событий боя
 
         if player["hp"] > 0: # Игрок победил
             gold_gain = int(monster["gold"] * (1 + player["gold_boost_percent"] / 100))
@@ -622,9 +608,8 @@ def game_loop(message):
             player["kills"] += 1
             player["bp_xp"] += bp_xp_gain
 
-            battle_log = (
-                f"Вы нанесли {int(base_player_damage)} урона " + ("💥*КРИТ!* " if is_crit else "") + f"и одолели *{monster['name']}*!\n"
-                f"Получено урона: {actual_monster_damage} ❤️ " + (f"(снижено вашей защитой на {monster_damage - actual_monster_damage})" if monster_damage > actual_monster_damage else "") + "\n"
+            final_battle_log += (
+                f"\n\n🎉 Вы победили *{monster['name']}*!\n"
                 f"Награда: +{gold_gain}💰, +{xp_gain} XP и **+{bp_xp_gain} очков БП 🌟**!\n"
                 f"Ваше здоровье: {player['hp']}/{player['max_hp']}"
             )
@@ -635,12 +620,12 @@ def game_loop(message):
                 player["xp"] -= xp_needed
                 player["max_hp"] += 20
                 player["hp"] = player["max_hp"]
-                battle_log += f"\n\n🎉 **УРОВЕНЬ ПОВЫШЕН!** Вы достигли {player['level']} уровня! Макс. HP увеличено!"
+                final_battle_log += f"\n\n🎉 **УРОВЕНЬ ПОВЫШЕН!** Вы достигли {player['level']} уровня! Макс. HP увеличено!"
 
         else: # Игрок проиграл
             player["gold"] = max(0, player["gold"] - 15)
-            battle_log = (
-                f"💀 *{monster['name']}* оказался сильнее и одолел вас!\n"
+            final_battle_log += (
+                f"\n\n💀 *{monster['name']}* оказался сильнее и одолел вас!\n"
                 f"Вы потеряли 15💰. Отдохните, чтобы восстановиться."
             )
 
@@ -648,7 +633,7 @@ def game_loop(message):
         
         bot.send_message(
             message.chat.id,
-            battle_log,
+            final_battle_log,
             parse_mode="Markdown",
             reply_markup=main_keyboard(),
         )
@@ -671,15 +656,14 @@ def game_loop(message):
             bot.send_message(message.chat.id, f"Босс еще не восстановился! Попробуйте через {minutes} мин. {seconds} сек.", reply_markup=main_keyboard())
             return
 
-        # Выбираем босса в зависимости от уровня игрока
         available_bosses = [b for k, b in BOSSES.items() if player["level"] >= b["level_req"]]
         if not available_bosses:
             bot.send_message(message.chat.id, "Вы пока слишком слабы, чтобы сражаться с боссами. Поднимите свой уровень!", reply_markup=main_keyboard())
             return
 
         boss = random.choice(available_bosses)
-        player["gold"] -= BOSS_FIGHT_COST # Отнимаем золото за попытку
-        player["last_boss_fight_timestamp"] = int(time.time()) # Обновляем время последнего боя
+        player["gold"] -= BOSS_FIGHT_COST
+        player["last_boss_fight_timestamp"] = int(time.time())
 
         bot.send_message(
             message.chat.id,
@@ -688,26 +672,36 @@ def game_loop(message):
         )
 
         # --- Симуляция боя с боссом ---
-        boss_hp = boss["hp"]
+        current_boss_hp = boss["hp"]
         
         boss_battle_log = []
-        while player["hp"] > 0 and boss_hp > 0:
+        while player["hp"] > 0 and current_boss_hp > 0:
             # Игрок атакует
-            player_hit_damage = random.randint(15, 25) + (player["level"] * 3) + player["dmg_bonus"]
+            player_base_damage = random.randint(15, 25) + (player["level"] * 3) + player["dmg_bonus"]
+            is_crit = False
             if random.randint(1, 100) <= player["crit_chance"]:
-                player_hit_damage *= 2
-                boss_battle_log.append(f"Вы нанесли {int(player_hit_damage)} урона (💥КРИТ!) *{boss['name']}*.")
-            else:
-                boss_battle_log.append(f"Вы нанесли {int(player_hit_damage)} урона *{boss['name']}*.")
-            boss_hp -= max(1, player_hit_damage - boss["defense"])
+                player_base_damage *= 2
+                is_crit = True
+            
+            player_actual_damage_to_boss = max(1, player_base_damage - boss["defense"])
+            current_boss_hp -= player_actual_damage_to_boss
+            
+            boss_battle_log.append(
+                f"Вы нанесли {int(player_actual_damage_to_boss)} урона " + 
+                ("💥*КРИТ!* " if is_crit else "") + 
+                f"*{boss['name']}* (осталось HP: {max(0, current_boss_hp)})."
+            )
 
-            if boss_hp <= 0: break # Босс побежден
+            if current_boss_hp <= 0: break # Босс побежден
 
             # Босс атакует
-            boss_hit_damage = random.randint(10, boss["dmg"])
-            actual_boss_damage = max(1, boss_hit_damage - player["defense"])
-            player["hp"] -= actual_boss_damage
-            boss_battle_log.append(f"*{boss['name']}* нанес вам {actual_boss_damage} урона.")
+            boss_base_damage = random.randint(10, boss["dmg"])
+            player_actual_damage_taken = max(1, boss_base_damage - player["defense"])
+            player["hp"] -= player_actual_damage_taken
+            
+            boss_battle_log.append(
+                f"*{boss['name']}* нанес вам {player_actual_damage_taken} урона (ваше HP: {max(0, player['hp'])})."
+            )
             
         if player["hp"] < 0: player["hp"] = 0
 
@@ -729,14 +723,12 @@ def game_loop(message):
                 f"Ваше здоровье: {player['hp']}/{player['max_hp']}"
             )
             
-            # Шанс выпадения уникального предмета
             if random.randint(1, 100) <= boss["item_drop_chance"] and boss["item_pool"]:
                 dropped_item_key = random.choice(boss["item_pool"])
                 player["inventory"].append(dropped_item_key)
-                apply_item_effects(player, dropped_item_key) # Применяем эффекты сразу
+                apply_item_effects(player, dropped_item_key)
                 final_message += f"\n🔥 Вы получили уникальный предмет: *{SHOP_ITEMS[dropped_item_key]['name']}*! Его эффекты применены."
 
-            # Левелап
             xp_needed = player["level"] * 50
             if player["xp"] >= xp_needed:
                 player["level"] += 1
@@ -746,7 +738,7 @@ def game_loop(message):
                 final_message += f"\n\n🎉 **УРОВЕНЬ ПОВЫШЕН!** Вы достигли {player['level']} уровня! Макс. HP увеличено!"
 
         else: # Игрок проиграл боссу
-            player["gold"] = max(0, player["gold"] - 50) # Штраф за поражение от босса
+            player["gold"] = max(0, player["gold"] - 50)
             final_message += (
                 f"\n\n💀 *{boss['name']}* оказался слишком силен и одолел вас!\n"
                 f"Вы потеряли 50💰. Отдохните, чтобы восстановиться."
@@ -783,7 +775,7 @@ def admin_panel(message):
         "/additem `<user_id>` `<item_key>` - Добавить предмет в инвентарь\n"
         "/removeitem `<user_id>` `<item_key>` - Удалить предмет из инвентаря\n"
         "/resetplayer `<user_id>` - Полностью сбросить игрока\n"
-        "/resetboss_cooldown `<user_id>` - Сбросить кулдаун босса (для тестов)\n" # Новая админ-команда
+        "/resetboss_cooldown `<user_id>` - Сбросить кулдаун босса (для тестов)\n"
         "/broadcast `<сообщение>` - Отправить сообщение всем игрокам"
     )
     bot.send_message(message.chat.id, admin_commands, parse_mode="Markdown")
@@ -899,7 +891,6 @@ def admin_add_item(message):
         return
 
     target_player["inventory"].append(item_key)
-    # Применяем эффекты предмета, если это не расходник
     if SHOP_ITEMS[item_key].get("type") != "consumable":
         apply_item_effects(target_player, item_key)
     
@@ -924,7 +915,6 @@ def admin_remove_item(message):
 
     if item_key in target_player["inventory"]:
         target_player["inventory"].remove(item_key)
-        # Снимаем эффекты предмета при продаже
         remove_item_effects(target_player, item_key)
         
         save_player(target_player)
@@ -1027,13 +1017,106 @@ def remove_item_effects(player, item_key):
     if "xp_boost_percent" in effects: player["xp_boost_percent"] = max(0, player["xp_boost_percent"] - effects["xp_boost_percent"])
 
 
+def send_bp_page(chat_id, user_id, page, message_id=None):
+    """Отправляет определенную страницу Батл Пасса.
+       Если message_id указан, редактирует сообщение, иначе отправляет новое."""
+    player = get_player(user_id, "Игрок")
+    
+    ITEMS_PER_PAGE = 10 # Сколько уровней БП на одной странице
+    all_tiers = sorted(BP_TIERS.keys())
+    total_pages = (len(all_tiers) + ITEMS_PER_PAGE - 1) // ITEMS_PER_PAGE
+    
+    # Защита от выхода за пределы страниц
+    page = max(1, min(page, total_pages))
+
+    start_index = (page - 1) * ITEMS_PER_PAGE
+    end_index = start_index + ITEMS_PER_PAGE
+    tiers_on_page = all_tiers[start_index:end_index]
+
+    text = f"🎫 *БОЕВОЙ ПРОПУСК (БАТЛ ПАСС)* 🎫\n"
+    text += f"Ваш прогресс: *{player['bp_xp']}* 🌟\n\n"
+    text += f"🎁 *Страница {page}/{total_pages}*:\n"
+    
+    inline_markup = types.InlineKeyboardMarkup()
+    
+    for tier in tiers_on_page:
+        data = BP_TIERS[tier]
+        if tier in player["bp_claimed"]:
+            status = "✅ Забрано"
+        elif player["bp_xp"] >= data["req"]:
+            status = "🎁 Доступно!"
+            btn = types.InlineKeyboardButton(
+                text=f"Получить Уровень {tier}", 
+                callback_data=f"claim_bp_{tier}_{page}" # Добавляем номер страницы в callback_data
+            )
+            inline_markup.add(btn)
+        else:
+            status = f"🔒 Закрыто (нужно {data['req']} 🌟)"
+            
+        text += f"• *Ур. {tier}*: {data['reward_text']} — {status}\n"
+    
+    # Кнопки навигации по страницам
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"bp_page_{page-1}"))
+    if page < total_pages:
+        nav_buttons.append(types.InlineKeyboardButton("Вперед ➡️", callback_data=f"bp_page_{page+1}"))
+    if nav_buttons:
+        inline_markup.add(*nav_buttons)
+
+    inline_markup.add(types.InlineKeyboardButton("✖️ Закрыть БП", callback_data="back_to_main"))
+    
+    if message_id:
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=inline_markup
+        )
+    else:
+        bot.send_message(
+            chat_id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=inline_markup
+        )
+
+
+# --- НОВЫЙ ОБРАБОТЧИК ДЛЯ ЛИСТАНИЯ СТРАНИЦ БП ---
+@bot.callback_query_handler(func=lambda call: call.data.startswith("bp_page_"))
+def bp_pagination_handler(call):
+    user_id = call.from_user.id
+    page = int(call.data.split("_")[2])
+    
+    # Редактируем текущее сообщение вместо удаления и отправки нового
+    send_bp_page(call.message.chat.id, user_id, page, call.message.message_id)
+    bot.answer_callback_query(call.id)
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("shop_"))
 def shop_callback_handler(call):
     user_id = call.from_user.id
     username = call.from_user.first_name
     player = get_player(user_id, username)
     
-    action = call.data.split("_")[1]
+    action_parts = call.data.split("_")
+    action = action_parts[1]
+
+    # Общая функция для обновления сообщения магазина
+    def update_shop_message(current_text, current_markup):
+        try:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=current_text,
+                parse_mode="Markdown",
+                reply_markup=current_markup
+            )
+        except Exception as e:
+            # Если сообщение не может быть отредактировано (например, оно старое)
+            bot.send_message(call.message.chat.id, current_text, parse_mode="Markdown", reply_markup=current_markup)
+            print(f"Ошибка редактирования сообщения магазина: {e}")
 
     if action == "buy_menu":
         text = "🛒 *Магазин: Покупка предметов*\n\n"
@@ -1042,12 +1125,9 @@ def shop_callback_handler(call):
         
         buy_markup = types.InlineKeyboardMarkup(row_width=1)
         for item_key, item_data in SHOP_ITEMS.items():
-            # Не показываем предметы, которые даются только с боссов (price = -1)
-            if item_data.get("price") == -1: continue 
-            
-            # Если это не расходник и уже есть в инвентаре, не показываем для покупки
+            if item_data.get("price") == -1: continue # Не показываем предметы с боссов
             if item_data.get("type") != "consumable" and item_key in player["inventory"]:
-                continue 
+                continue # Не показываем не-расходники, если они уже есть
             
             text += f"• *{item_data['name']}* ({item_data['description']}) - {item_data['price']}💰\n"
             buy_markup.add(types.InlineKeyboardButton(
@@ -1055,13 +1135,7 @@ def shop_callback_handler(call):
                 callback_data=f"shop_buy_item_{item_key}"
             ))
         buy_markup.add(types.InlineKeyboardButton("🔙 В магазин", callback_data="shop_main_menu"))
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=buy_markup
-        )
+        update_shop_message(text, buy_markup)
         bot.answer_callback_query(call.id)
 
     elif action == "sell_menu":
@@ -1089,17 +1163,11 @@ def shop_callback_handler(call):
                 ))
         
         sell_markup.add(types.InlineKeyboardButton("🔙 В магазин", callback_data="shop_main_menu"))
-        bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=text,
-            parse_mode="Markdown",
-            reply_markup=sell_markup
-        )
+        update_shop_message(text, sell_markup)
         bot.answer_callback_query(call.id)
 
     elif action == "buy_item":
-        item_key = call.data.split("_")[3]
+        item_key = action_parts[3]
         item_data = SHOP_ITEMS.get(item_key)
         
         if not item_data:
@@ -1112,22 +1180,20 @@ def shop_callback_handler(call):
 
         player["gold"] -= item_data["price"]
         
-        # Если это расходник, то сразу используем и не добавляем в инвентарь
         if item_data.get("type") == "consumable":
             apply_item_effects(player, item_key)
-            save_player(player) # Сохраняем после использования
+            save_player(player)
             bot.answer_callback_query(call.id, f"Вы использовали {item_data['name']}!", show_alert=True)
         else:
             player["inventory"].append(item_key)
             apply_item_effects(player, item_key)
-            save_player(player) # Сохраняем после добавления
+            save_player(player)
             bot.answer_callback_query(call.id, f"Вы купили {item_data['name']}!", show_alert=True)
         
-        # Обновляем сообщение магазина
         shop_callback_handler(types.CallbackQuery(id=call.id, from_user=call.from_user, message=call.message, data="shop_buy_menu"))
 
     elif action == "sell_item":
-        item_key = call.data.split("_")[3]
+        item_key = action_parts[3]
         item_data = SHOP_ITEMS.get(item_key)
         
         if not item_data:
@@ -1141,13 +1207,11 @@ def shop_callback_handler(call):
         player["gold"] += item_data["sell_price"]
         player["inventory"].remove(item_key)
         
-        # Снимаем эффекты предмета при продаже
         remove_item_effects(player, item_key)
         
         save_player(player)
         bot.answer_callback_query(call.id, f"Вы продали {item_data['name']}!", show_alert=True)
 
-        # Обновляем сообщение магазина
         shop_callback_handler(types.CallbackQuery(id=call.id, from_user=call.from_user, message=call.message, data="shop_sell_menu"))
 
     elif action == "main_menu":
@@ -1169,15 +1233,18 @@ def shop_callback_handler(call):
         bot.answer_callback_query(call.id)
 
 
-# --- ОБРАБОТКА НАЖАТИЯ КНОПОК БАТЛ ПАССА ---
+# --- ОБРАБОТКА НАЖАТИЯ КНОПОК БАТЛ ПАССА (НЕ ИЗМЕНИЛАСЬ) ---
 @bot.callback_query_handler(func=lambda call: call.data.startswith("claim_bp_"))
 def claim_bp_reward(call):
     user_id = call.from_user.id
     username = call.from_user.first_name
     player = get_player(user_id, username)
     
-    tier = int(call.data.split("_")[2])
-    
+    # Извлекаем номер страницы из callback_data
+    parts = call.data.split("_")
+    tier = int(parts[2])
+    current_page = int(parts[3]) if len(parts) > 3 else 1 # Дефолт 1, если нет страницы
+
     if tier not in BP_TIERS:
         bot.answer_callback_query(call.id, "Ошибка: уровень не найден.")
         return
@@ -1209,7 +1276,7 @@ def claim_bp_reward(call):
         reward_msg += f"🛡️ Надето новое снаряжение! Максимальное здоровье увеличено на +{data['hp_boost']} ❤️\n"
         
     if "dmg_boost" in data:
-        player["dmg_bonus"] += data["dmg_boost"]
+        player["dmg_bonus"] += data["dmg_bonus"]
         reward_msg += f"⚔️ Получено новое оружие! Постоянный урон увеличен на +{data['dmg_bonus']} ⚔️\n"
 
     if "crit_chance_boost" in data:
@@ -1239,12 +1306,16 @@ def claim_bp_reward(call):
     save_player(player)
 
     bot.answer_callback_query(call.id, "Награда получена!")
+    
+    # Теперь мы редактируем сообщение, чтобы показать награду,
+    # а затем сразу же обновляем страницу БП
     bot.edit_message_text(
         chat_id=call.message.chat.id,
         message_id=call.message.message_id,
         text=reward_msg,
         parse_mode="Markdown"
     )
+    send_bp_page(call.message.chat.id, user_id, current_page)
 
 
 # ================= ЗАПУСК ПРИЛОЖЕНИЯ =================
