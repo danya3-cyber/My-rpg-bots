@@ -22,12 +22,42 @@ if not TOKEN:
 
 bot = telebot.TeleBot(TOKEN)
 
+# ================= НАСТРОЙКА АДМИНКИ =================
+# ВСТАВЬТЕ СВОЙ TELEGRAM ID СЮДА!
+# Можно добавить несколько ID через запятую: ADMIN_IDS = [123456789, 987654321]
+ADMIN_IDS = [6597219983] # <--- ЗАМЕНИТЕ НА СВОЙ ID!
+
+def is_admin(message):
+    """Проверяет, является ли пользователь администратором."""
+    return message.from_user.id in ADMIN_IDS
+
+def parse_admin_args(message_text, num_args=2):
+    """Парсит аргументы для админ-команд: /команда <user_id> <значение>"""
+    parts = message_text.split()
+    if len(parts) < 1 + num_args: # Команда + user_id + значение
+        return None, None, None # Недостаточно аргументов
+
+    try:
+        target_user_id = int(parts[1])
+        # Для команд с одним числовым аргументом
+        if num_args == 1:
+            return target_user_id, None, parts[0]
+        
+        # Для команд с двумя аргументами (ID + значение)
+        if num_args == 2:
+            value = parts[2]
+            return target_user_id, value, parts[0]
+            
+    except ValueError:
+        return None, None, None # Неверный формат ID или значения
+    return None, None, None
+
+
 # ================= НАСТРОЙКА БАЗЫ ДАННЫХ =================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 IS_POSTGRES = DATABASE_URL is not None and HAS_PSYCOPG2
 
 def get_db_connection():
-    """Подключение к Postgres в облаке или к SQLite локально"""
     if IS_POSTGRES:
         #print("Подключение к PostgreSQL...")
         return psycopg2.connect(DATABASE_URL, sslmode='require')
@@ -37,11 +67,9 @@ def get_db_connection():
 
 
 def init_db():
-    """Создание таблицы игроков и добавление новых колонок, если их нет"""
     conn = get_db_connection()
     cur = conn.cursor()
     
-    # 1. Создаем таблицу, если она не существует
     cur.execute("""
         CREATE TABLE IF NOT EXISTS players (
             user_id BIGINT PRIMARY KEY,
@@ -63,7 +91,6 @@ def init_db():
     """)
     conn.commit()
 
-    # 2. Добавляем новые колонки, если они отсутствуют (для совместимости со старыми базами)
     columns_to_add = {
         "crit_chance": "INTEGER DEFAULT 5",
         "defense": "INTEGER DEFAULT 0",
@@ -76,26 +103,18 @@ def init_db():
     else:
         cur.execute("PRAGMA table_info(players);")
     
-    existing_columns = [col[0] for col in cur.fetchall()]
+    existing_columns = [col[1] for col in cur.fetchall()] # Для SQLite cur.fetchall() возвращает (cid, name, type, notnull, dflt_value, pk)
 
     for col_name, col_type in columns_to_add.items():
         if col_name not in existing_columns:
             try:
-                # В SQLite не поддерживается ADD COLUMN IF NOT EXISTS, поэтому используем TRY-EXCEPT
                 cur.execute(f"ALTER TABLE players ADD COLUMN {col_name} {col_type};")
                 conn.commit()
                 print(f"Добавлена колонка: {col_name}")
-            except sqlite3.OperationalError as e:
-                # Если колонка уже добавлена другим способом или ошибка
-                print(f"Ошибка при добавлении колонки {col_name} в SQLite: {e}")
-            except psycopg2.ProgrammingError as e:
-                # Для Postgres
-                if "column already exists" in str(e):
-                    print(f"Колонка {col_name} уже существует в PostgreSQL.")
-                    conn.rollback() # Откатываем транзакцию, если ошибка
-                else:
-                    print(f"Ошибка при добавлении колонки {col_name} в PostgreSQL: {e}")
-                    conn.rollback()
+            except (sqlite3.OperationalError, psycopg2.ProgrammingError) as e:
+                # Если колонка уже добавлена или другая ошибка, откатываем транзакцию
+                print(f"Ошибка при добавлении колонки {col_name}: {e}")
+                conn.rollback() 
 
 
     cur.close()
@@ -104,7 +123,6 @@ def init_db():
 
 
 def get_player(user_id, username):
-    """Получение данных игрока или создание нового"""
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -129,13 +147,13 @@ def get_player(user_id, username):
             "bp_xp": 0,
             "bp_claimed": [],
             "dmg_bonus": 0,
-            "crit_chance": 5, # Дефолтный шанс крита 5%
-            "defense": 0,     # Дефолтная защита
-            "gold_boost_percent": 0, # Дефолтный бонус к золоту
-            "xp_boost_percent": 0    # Дефолтный бонус к опыту
+            "crit_chance": 5,
+            "defense": 0,
+            "gold_boost_percent": 0,
+            "xp_boost_percent": 0
         }
         
-        bp_claimed_str = json.dumps(player["bp_claimed"]) # [] -> "[]"
+        bp_claimed_str = json.dumps(player["bp_claimed"])
         
         if IS_POSTGRES:
             cur.execute(f"""
@@ -179,7 +197,6 @@ def get_player(user_id, username):
 
 
 def save_player(player):
-    """Сохранение данных конкретного игрока в базу"""
     conn = get_db_connection()
     cur = conn.cursor()
     bp_claimed_str = json.dumps(player["bp_claimed"])
@@ -213,6 +230,17 @@ def save_player(player):
     conn.commit()
     cur.close()
     conn.close()
+
+
+def get_all_player_ids():
+    """Возвращает список всех user_id в базе данных."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM players;")
+    user_ids = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return user_ids
 
 
 # ================= ВЕБ-СЕРВЕР ДЛЯ ХОСТИНГА (24/7) =================
@@ -285,7 +313,166 @@ def start_game(message):
         message.chat.id, welcome_text, reply_markup=main_keyboard(), parse_mode="Markdown"
     )
 
+# ================= АДМИН-КОМАНДЫ =================
+@bot.message_handler(commands=['admin'], func=is_admin)
+def admin_panel(message):
+    admin_commands = (
+        "🤖 *Панель Администратора*\n\n"
+        "Доступные команды:\n"
+        "/getstats `<user_id>` - Просмотр профиля игрока\n"
+        "/setgold `<user_id>` `<amount>` - Установить золото\n"
+        "/setxp `<user_id>` `<amount>` - Установить опыт\n"
+        "/setlevel `<user_id>` `<amount>` - Установить уровень\n"
+        "/sethp `<user_id>` `<amount>` - Установить текущее здоровье\n"
+        "/setmaxhp `<user_id>` `<amount>` - Установить максимальное здоровье\n"
+        "/setbp_xp `<user_id>` `<amount>` - Установить очки БП\n"
+        "/setdmg_bonus `<user_id>` `<amount>` - Установить бонус к урону\n"
+        "/setcrit_chance `<user_id>` `<amount>` - Установить шанс крита\n"
+        "/setdefense `<user_id>` `<amount>` - Установить защиту\n"
+        "/setgold_boost `<user_id>` `<amount>` - Установить бонус к золоту (%%)\n"
+        "/setxp_boost `<user_id>` `<amount>` - Установить бонус к опыту (%%)\n"
+        "/resetplayer `<user_id>` - Полностью сбросить игрока\n"
+        "/broadcast `<сообщение>` - Отправить сообщение всем игрокам"
+    )
+    bot.send_message(message.chat.id, admin_commands, parse_mode="Markdown")
 
+@bot.message_handler(commands=['getstats'], func=is_admin)
+def admin_get_stats(message):
+    target_user_id, _, command = parse_admin_args(message.text, num_args=1)
+    if not target_user_id:
+        bot.reply_to(message, "Неверный формат команды. Используйте: /getstats <user_id>")
+        return
+
+    target_player = get_player(target_user_id, "Админ_цель") # Имя может быть не актуальным
+    if not target_player:
+        bot.reply_to(message, f"Игрок с ID {target_user_id} не найден.")
+        return
+
+    min_dmg = 15 + (target_player["level"] * 3) + target_player["dmg_bonus"]
+    max_dmg = 25 + (target_player["level"] * 3) + target_player["dmg_bonus"]
+
+    stats = (
+        f"👤 *Игрок:* {target_player['name']} (ID: {target_player['user_id']})\n"
+        f"🏅 *Уровень:* {target_player['level']} ({target_player['xp']}/{(target_player['level']*50)} XP)\n"
+        f"❤️ *Здоровье:* {target_player['hp']}/{target_player['max_hp']}\n"
+        f"⚔️ *Сила атаки:* {min_dmg}-{max_dmg} (+{target_player['dmg_bonus']} ⚔️)\n"
+        f"🛡️ *Защита:* +{target_player['defense']} \n"
+        f"💥 *Шанс крита:* {target_player['crit_chance']}% \n"
+        f"💰 *Золото:* {target_player['gold']} (+{target_player['gold_boost_percent']}%) \n"
+        f"🌟 *Очки БП:* {target_player['bp_xp']} (+{target_player['xp_boost_percent']}% к XP)\n"
+        f"💀 *Побеждено монстров:* {target_player['kills']}\n"
+        f"🎫 *БП Забрано:* {target_player['bp_claimed']}"
+    )
+    bot.send_message(message.chat.id, stats, parse_mode="Markdown")
+
+
+@bot.message_handler(func=lambda message: is_admin(message) and message.text.startswith((
+    '/setgold', '/setxp', '/setlevel', '/sethp', '/setmaxhp', '/setbp_xp', 
+    '/setdmg_bonus', '/setcrit_chance', '/setdefense', '/setgold_boost', '/setxp_boost'
+)))
+def admin_set_stat(message):
+    target_user_id, value_str, command = parse_admin_args(message.text, num_args=2)
+    
+    if not target_user_id or value_str is None:
+        bot.reply_to(message, "Неверный формат команды. Используйте: /команда <user_id> <значение>")
+        return
+
+    try:
+        value = int(value_str)
+    except ValueError:
+        bot.reply_to(message, "Значение должно быть числом.")
+        return
+
+    target_player = get_player(target_user_id, "Админ_цель")
+    if not target_player:
+        bot.reply_to(message, f"Игрок с ID {target_user_id} не найден.")
+        return
+
+    stat_map = {
+        '/setgold': 'gold',
+        '/setxp': 'xp',
+        '/setlevel': 'level',
+        '/sethp': 'hp',
+        '/setmaxhp': 'max_hp',
+        '/setbp_xp': 'bp_xp',
+        '/setdmg_bonus': 'dmg_bonus',
+        '/setcrit_chance': 'crit_chance',
+        '/setdefense': 'defense',
+        '/setgold_boost': 'gold_boost_percent',
+        '/setxp_boost': 'xp_boost_percent'
+    }
+    stat_name = stat_map.get(command)
+
+    if stat_name:
+        # Особая логика для некоторых параметров
+        if stat_name == 'level':
+            target_player['level'] = max(1, value) # Уровень не может быть меньше 1
+            target_player['max_hp'] = 100 + (target_player['level'] - 1) * 20
+            target_player['hp'] = target_player['max_hp'] # Полное хил при смене уровня
+        elif stat_name == 'hp':
+            target_player['hp'] = min(value, target_player['max_hp']) # HP не может быть выше MAX_HP
+            target_player['hp'] = max(0, target_player['hp']) # HP не может быть ниже 0
+        elif stat_name == 'max_hp':
+            target_player['max_hp'] = max(1, value) # Макс HP не может быть ниже 1
+            if target_player['hp'] > target_player['max_hp']:
+                target_player['hp'] = target_player['max_hp'] # Если текущее выше нового макс, обрезаем
+        elif stat_name in ['crit_chance', 'defense', 'gold_boost_percent', 'xp_boost_percent']:
+            target_player[stat_name] = max(0, value) # Эти параметры не могут быть отрицательными
+        else:
+            target_player[stat_name] = value
+
+        save_player(target_player)
+        bot.reply_to(message, f"Значение '{stat_name}' для игрока {target_player['name']} (ID: {target_user_id}) установлено на {value}.")
+        try:
+            bot.send_message(target_user_id, f"⚡️ Администратор изменил ваш *{stat_name}* на *{value}*!", parse_mode="Markdown")
+        except Exception as e:
+            print(f"Не удалось уведомить игрока {target_user_id}: {e}")
+    else:
+        bot.reply_to(message, "Неизвестная команда или некорректная характеристика.")
+
+@bot.message_handler(commands=['resetplayer'], func=is_admin)
+def admin_reset_player(message):
+    target_user_id, _, command = parse_admin_args(message.text, num_args=1)
+    if not target_user_id:
+        bot.reply_to(message, "Неверный формат команды. Используйте: /resetplayer <user_id>")
+        return
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    if IS_POSTGRES:
+        cur.execute("DELETE FROM players WHERE user_id = %s", (target_user_id,))
+    else:
+        cur.execute("DELETE FROM players WHERE user_id = ?", (target_user_id,))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    bot.reply_to(message, f"Прогресс игрока с ID {target_user_id} был сброшен.")
+    try:
+        bot.send_message(target_user_id, "💀 Ваш прогресс был сброшен администратором. Начните игру с /start.")
+    except Exception as e:
+        print(f"Не удалось уведомить игрока {target_user_id}: {e}")
+
+@bot.message_handler(commands=['broadcast'], func=is_admin)
+def admin_broadcast(message):
+    broadcast_message = message.text.replace("/broadcast ", "", 1)
+    if not broadcast_message:
+        bot.reply_to(message, "Вы не указали сообщение для рассылки.")
+        return
+
+    all_user_ids = get_all_player_ids()
+    sent_count = 0
+    for user_id in all_user_ids:
+        try:
+            bot.send_message(user_id, f"📢 *Сообщение от Администратора:*\n{broadcast_message}", parse_mode="Markdown")
+            sent_count += 1
+        except Exception as e:
+            print(f"Не удалось отправить сообщение пользователю {user_id}: {e}")
+    
+    bot.reply_to(message, f"Сообщение отправлено {sent_count} игрокам.")
+
+
+# ================= ОСНОВНОЙ ЦИКЛ ИГРЫ =================
 @bot.message_handler(content_types=["text"])
 def game_loop(message):
     user_id = message.from_user.id
@@ -384,14 +571,13 @@ def game_loop(message):
             {"name": "Дракон", "hp": 120, "dmg": 35, "gold": 80, "xp": 100, "bp_xp": 20}
         ]
         
-        # Подбираем монстра по уровню
         available_monsters = []
         if player["level"] < 3:
-            available_monsters = monsters[:2] # Слизень, Гоблин
+            available_monsters = monsters[:2]
         elif player["level"] < 6:
-            available_monsters = monsters[:3] # Слизень, Гоблин, Орк
+            available_monsters = monsters[:3]
         else:
-            available_monsters = monsters    # Все монстры
+            available_monsters = monsters    
             
         monster = random.choice(available_monsters)
 
@@ -401,24 +587,21 @@ def game_loop(message):
             parse_mode="Markdown",
         )
 
-        # Расчет урона игрока
         base_player_damage = random.randint(15, 25) + (player["level"] * 3) + player["dmg_bonus"]
         
         is_crit = False
         if random.randint(1, 100) <= player["crit_chance"]:
-            base_player_damage *= 2 # Удвоенный урон при крите
+            base_player_damage *= 2
             is_crit = True
 
-        # Расчет урона монстра с учетом защиты игрока
         monster_damage = random.randint(5, monster["dmg"])
-        actual_monster_damage = max(1, monster_damage - player["defense"]) # Защита снижает урон, минимум 1
+        actual_monster_damage = max(1, monster_damage - player["defense"])
 
         player["hp"] -= actual_monster_damage
         if player["hp"] < 0:
             player["hp"] = 0
 
         if player["hp"] > 0:
-            # Награды с учетом бустов
             gold_gain = int(monster["gold"] * (1 + player["gold_boost_percent"] / 100))
             xp_gain = int(monster["xp"] * (1 + player["xp_boost_percent"] / 100))
             bp_xp_gain = monster["bp_xp"]
@@ -435,7 +618,6 @@ def game_loop(message):
                 f"Ваше здоровье: {player['hp']}/{player['max_hp']}"
             )
 
-            # Левелап
             xp_needed = player["level"] * 50
             if player["xp"] >= xp_needed:
                 player["level"] += 1
@@ -488,7 +670,6 @@ def claim_bp_reward(call):
     
     reward_msg = f"🎉 *Поздравляем!*\nВы получили награду за {tier}-й Уровень БП:\n"
     
-    # Выдаем награды
     if data.get("gold", 0) > 0:
         player["gold"] += data["gold"]
         reward_msg += f"+{data['gold']}💰 Золота\n"
@@ -521,7 +702,6 @@ def claim_bp_reward(call):
         player["xp_boost_percent"] += data["xp_boost_percent"]
         reward_msg += f"✨ Получен Свиток! Бонус к опыту увеличен на +{data['xp_boost_percent']}% XP ✨\n"
         
-    # Проверка уровня после добавления XP
     xp_needed = player["level"] * 50
     if player["xp"] >= xp_needed:
         player["level"] += 1
@@ -543,10 +723,10 @@ def claim_bp_reward(call):
 
 # ================= ЗАПУСК ПРИЛОЖЕНИЯ =================
 if __name__ == "__main__":
-    init_db() # Инициализация базы данных
+    init_db()
     
     print("Запуск веб-сервера для круглосуточного хостинга...")
-    keep_alive() # Запуск Flask в отдельном потоке
+    keep_alive()
     
-    print(f"RPG Бот с 20 уровнями БП и {('PostgreSQL' if IS_POSTGRES else 'SQLite')} базой данных успешно запущен!")
+    print(f"RPG Бот с админкой и {('PostgreSQL' if IS_POSTGRES else 'SQLite')} базой данных успешно запущен!")
     bot.polling(none_stop=True)
